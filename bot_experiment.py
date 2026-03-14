@@ -1,9 +1,16 @@
 """
-NM i AI 2026 — Grocery Bot (experimental: permutation trip planner)
+NM i AI 2026 — Grocery Bot (experimental v2: cross-order planning)
 Usage:
     python bot_experiment.py --token YOUR_TOKEN
 
-Get a token by clicking "Play" on a map at https://app.ainm.no/challenge
+Changes from v1:
+  - Unified cross-order planning: preview items fill spare capacity in the
+    same permutation search as active items (no more detour-≤-4 heuristic)
+  - Two-trip optimization: for orders needing >3 items, picks the subset
+    that minimises total cost across BOTH trips
+  - Grab-on-the-way: when all active items are collected, grabs preview
+    items if the detour is ≤ ~10 rounds (saves a full trip later)
+  - Smarter drop-off zone selection across all plans
 """
 
 import asyncio
@@ -14,295 +21,385 @@ from itertools import permutations as iperms
 
 WS_URL = "wss://game.ainm.no/ws?token={token}"
 
+# Max detour (rounds) to grab preview items when active order is already fulfilled
+MAX_PREVIEW_DETOUR = 10
+
 
 # ---------------------------------------------------------------------------
 # Pathfinding
 # ---------------------------------------------------------------------------
 
-def bfs(start, goal, walls, width, height, blocked=None):
-    """Return the first action to take toward goal, or 'wait' if unreachable."""
+def bfs_first_action(start, goal, wall_set, width, height):
+    """Return the first move action toward goal, or 'wait'."""
     if start == goal:
         return "wait"
-    wall_set = set(map(tuple, walls))
-    queue = deque([(start[0], start[1], [])])
+    queue = deque([(start[0], start[1], None)])
     visited = {start}
-    dirs = [("move_up",0,-1), ("move_down",0,1), ("move_left",-1,0), ("move_right",1,0)]
+    dirs = [("move_up",0,-1),("move_down",0,1),("move_left",-1,0),("move_right",1,0)]
     while queue:
-        x, y, path = queue.popleft()
+        x, y, first = queue.popleft()
         for action, dx, dy in dirs:
-            nx, ny = x+dx, y+dy
-            if (nx,ny) in visited or nx<0 or ny<0 or nx>=width or ny>=height:
+            nx, ny = x + dx, y + dy
+            if (nx, ny) in visited or nx < 0 or ny < 0 or nx >= width or ny >= height:
                 continue
-            if (nx,ny) in wall_set:
+            if (nx, ny) in wall_set:
                 continue
-            new_path = path + [action]
-            if (nx,ny) == goal:
-                return new_path[0]
-            visited.add((nx,ny))
-            queue.append((nx, ny, new_path))
+            fa = first or action
+            if (nx, ny) == goal:
+                return fa
+            visited.add((nx, ny))
+            queue.append((nx, ny, fa))
     return "wait"
 
 
-def bfs_all_dists(start, wall_set, width, height):
-    """BFS from start; returns {(x,y): distance} for all reachable cells."""
+def bfs_dists(start, wall_set, width, height):
+    """BFS flood-fill from start. Returns {(x,y): distance}."""
     dist = {start: 0}
     queue = deque([start])
     while queue:
         x, y = queue.popleft()
+        d = dist[(x, y)]
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]:
-            nx, ny = x+dx, y+dy
-            if (nx,ny) in dist or nx<0 or ny<0 or nx>=width or ny>=height:
+            nx, ny = x + dx, y + dy
+            if (nx, ny) in dist or nx < 0 or ny < 0 or nx >= width or ny >= height:
                 continue
-            if (nx,ny) in wall_set:
+            if (nx, ny) in wall_set:
                 continue
-            dist[(nx,ny)] = dist[(x,y)] + 1
-            queue.append((nx,ny))
+            dist[(nx, ny)] = d + 1
+            queue.append((nx, ny))
     return dist
 
 
 def manhattan(a, b):
-    return abs(a[0]-b[0]) + abs(a[1]-b[1])
-
-
-def is_adjacent(pos, target):
-    return manhattan(pos, target) == 1
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
 # ---------------------------------------------------------------------------
 # State helpers
 # ---------------------------------------------------------------------------
 
-def get_needed_items(state):
-    """Item types still required by the active order (minus already delivered)."""
+def get_order_info(state):
+    """Returns (active_remaining, preview_needed) lists of item types."""
     active = next((o for o in state["orders"] if o["status"] == "active"), None)
-    if not active:
-        return []
-    needed = list(active["items_required"])
-    for d in active["items_delivered"]:
-        if d in needed:
-            needed.remove(d)
-    return needed
-
-
-def get_preview_items(state):
-    """Item types in the upcoming preview order."""
     preview = next((o for o in state["orders"] if o["status"] == "preview"), None)
-    return list(preview["items_required"]) if preview else []
 
+    active_remaining = []
+    if active:
+        active_remaining = list(active["items_required"])
+        for d in active["items_delivered"]:
+            if d in active_remaining:
+                active_remaining.remove(d)
 
-def nearest_drop_off(pos, state):
-    zones = state.get("drop_off_zones", [state["drop_off"]])
-    return min(zones, key=lambda z: manhattan(pos, z))
+    preview_needed = list(preview["items_required"]) if preview else []
+    return active_remaining, preview_needed
 
 
 def pickup_cells(item_pos, wall_set, width, height):
-    """Walkable floor cells adjacent to a shelf item."""
+    """Walkable cells adjacent to a shelf item."""
     ix, iy = item_pos
     return [
-        (ix+dx, iy+dy)
+        (ix + dx, iy + dy)
         for dx, dy in [(0,-1),(0,1),(-1,0),(1,0)]
-        if 0 <= ix+dx < width and 0 <= iy+dy < height
-        and (ix+dx, iy+dy) not in wall_set
+        if 0 <= ix + dx < width and 0 <= iy + dy < height
+        and (ix + dx, iy + dy) not in wall_set
     ]
 
 
-# ---------------------------------------------------------------------------
-# Trip planner
-# ---------------------------------------------------------------------------
-
-def plan_trip(pos, inventory, needed, preview_types,
-              items_on_map, assigned_items,
-              eff_wall_set, width, height, drop_off):
+def preview_still_needed(inventory, active_needed, preview_needed):
     """
-    Plan the optimal trip for one bot:
-      - Select up to (3 - len(inventory)) items to collect
-      - Find the permutation that minimises total travel distance
-      - Opportunistically insert preview items en route if detour <= 4 moves
+    After the bot delivers at drop-off, active-matching items leave inventory.
+    Remaining items might already satisfy parts of the preview order.
+    Returns a Counter of preview types we still need to fetch.
+    """
+    # Simulate delivery: remove inventory items that match active order
+    post_delivery = list(inventory)
+    temp_active = list(active_needed)
+    for item in list(post_delivery):
+        if item in temp_active:
+            post_delivery.remove(item)
+            temp_active.remove(item)
 
-    Returns list of (item_id, pickup_cell) in execution order.
+    # What preview items do we already have after delivery?
+    have = Counter(post_delivery)
+    need = Counter(preview_needed)
+    for t in list(need):
+        need[t] = max(0, need[t] - have.get(t, 0))
+    return +need  # drop zero counts
+
+
+# ---------------------------------------------------------------------------
+# Trip planner v2
+# ---------------------------------------------------------------------------
+
+def plan_trip(pos, inventory, active_needed, preview_needed,
+              items_on_map, assigned_items,
+              wall_set, width, height, drop_zones):
+    """
+    Plan optimal item collection trip.
+
+    Returns (plan, drop_zone, cost) where:
+      plan = [(item_id, pickup_cell), ...] in execution order
+      drop_zone = (x, y) best drop-off for this plan
+      cost = total BFS-distance rounds for the full trip
     """
     INV_CAP = 3
-    capacity_left = INV_CAP - len(inventory)
-    remaining_needed = list((Counter(needed) - Counter(inventory)).elements())
-    remaining_counter = Counter(remaining_needed)
+    capacity = INV_CAP - len(inventory)
+    if capacity <= 0:
+        return [], drop_zones[0], 0
 
-    if not remaining_counter or capacity_left == 0:
-        return []
+    # Remaining active items (accounting for inventory)
+    remaining = list((Counter(active_needed) - Counter(inventory)).elements())
+    remaining_ctr = Counter(remaining)
 
-    # Collect candidates with valid pickup cells
+    # Preview items still needed (accounting for what we'll have after delivery)
+    preview_ctr = preview_still_needed(inventory, active_needed, preview_needed)
+
+    # Build candidates
     item_cells = {}
-    candidates = []
+    active_cands, preview_cands = [], []
+    active_ids, preview_ids = set(), set()
+
     for item in items_on_map:
-        if item["type"] not in remaining_counter or item["id"] in assigned_items:
+        if item["id"] in assigned_items:
             continue
-        cells = pickup_cells(tuple(item["position"]), eff_wall_set, width, height)
-        if cells:
-            item_cells[item["id"]] = cells
-            candidates.append(item)
+        cells = pickup_cells(tuple(item["position"]), wall_set, width, height)
+        if not cells:
+            continue
+        item_cells[item["id"]] = cells
+        if item["type"] in remaining_ctr:
+            active_cands.append(item)
+            active_ids.add(item["id"])
+        elif item["type"] in preview_ctr:
+            preview_cands.append(item)
+            preview_ids.add(item["id"])
 
-    if not candidates:
-        return []
+    def prune(cands, n=3):
+        by_type = {}
+        for it in cands:
+            by_type.setdefault(it["type"], []).append(it)
+        out = []
+        for group in by_type.values():
+            group.sort(key=lambda i: manhattan(pos, tuple(i["position"])))
+            out.extend(group[:n])
+        return out
 
-    # Prune to 3 closest items per type to keep search tractable
-    by_type = {}
-    for item in candidates:
-        by_type.setdefault(item["type"], []).append(item)
-    pruned = []
-    for items in by_type.values():
-        items.sort(key=lambda i: manhattan(pos, tuple(i["position"])))
-        pruned.extend(items[:3])
+    active_pruned = prune(active_cands)
+    preview_pruned = prune(preview_cands)
 
-    k = min(capacity_left, len(remaining_needed))
+    active_k = min(capacity, len(remaining))
+    preview_slots = capacity - active_k
 
-    # Pre-compute BFS distance maps from pos and all candidate pickup cells
-    drop_t = tuple(drop_off)
-    all_source_cells = {c for item in pruned for c in item_cells[item["id"]]}
-    all_source_cells.add(drop_t)
-    dist_from = {pos: bfs_all_dists(pos, eff_wall_set, width, height)}
-    for cell in all_source_cells:
-        if cell not in dist_from:
-            dist_from[cell] = bfs_all_dists(cell, eff_wall_set, width, height)
+    # --- Pre-compute BFS distances ---
+    sources = {pos}
+    for it in active_pruned + preview_pruned:
+        sources.update(item_cells[it["id"]])
+    for dz in drop_zones:
+        sources.add(dz)
 
-    def route_cost_and_cells(ordered_items):
-        """Total distance: pos → item0.cell → item1.cell → … → drop_off."""
+    dist = {}
+    for s in sources:
+        if s not in dist:
+            dist[s] = bfs_dists(s, wall_set, width, height)
+
+    def route_cost(seq, start, end):
+        """Cost: start → items (best pickup cell each) → end."""
         cost = 0
-        cur = pos
-        used_cells = []
-        for item in ordered_items:
+        cur = start
+        cells = []
+        for it in seq:
             best_d, best_c = float('inf'), None
-            for c in item_cells[item["id"]]:
-                d = dist_from[cur].get(c, float('inf'))
+            for c in item_cells[it["id"]]:
+                d = dist.get(cur, {}).get(c, float('inf'))
                 if d < best_d:
                     best_d, best_c = d, c
             if best_c is None:
                 return float('inf'), []
             cost += best_d
             cur = best_c
-            used_cells.append(best_c)
-        cost += dist_from[cur].get(drop_t, float('inf'))
-        return cost, used_cells
+            cells.append(best_c)
+        cost += dist.get(cur, {}).get(end, float('inf'))
+        return cost, cells
 
-    # Permutation search: find the ordering of k items with minimum route cost
-    best_cost, best_items, best_cells = float('inf'), None, None
-    for perm in iperms(pruned, k):
-        tc = Counter(i["type"] for i in perm)
-        if any(tc[t] > remaining_counter[t] for t in tc):
+    # ================================================================
+    # CASE 1: Multi-trip  (active order needs > capacity items)
+    # Pick the subset that minimises trip1 + estimated trip2.
+    # ================================================================
+    if len(remaining) > capacity:
+        best_total, best_plan, best_dz = float('inf'), None, drop_zones[0]
+
+        for perm in iperms(active_pruned, active_k):
+            tc = Counter(i["type"] for i in perm)
+            if any(tc[t] > remaining_ctr[t] for t in tc):
+                continue
+
+            for dz in drop_zones:
+                t1_cost, t1_cells = route_cost(perm, pos, dz)
+                if t1_cost >= float('inf'):
+                    continue
+
+                # Estimate trip 2: remaining types, round-trip from drop-off
+                picked = Counter(i["type"] for i in perm)
+                leftover = remaining_ctr - picked
+
+                t2_cost = 0
+                for t, cnt in leftover.items():
+                    avail = sorted(
+                        [i for i in active_pruned if i["type"] == t and i not in perm],
+                        key=lambda i: min(
+                            (dist.get(dz, {}).get(c, 999) for c in item_cells[i["id"]]),
+                            default=999,
+                        ),
+                    )
+                    for it in avail[:cnt]:
+                        d = min(
+                            (dist.get(dz, {}).get(c, 999) for c in item_cells[it["id"]]),
+                            default=999,
+                        )
+                        t2_cost += d * 2  # round-trip estimate
+
+                total = t1_cost + t2_cost
+                if total < best_total:
+                    best_total = total
+                    best_plan = list(zip([i["id"] for i in perm], t1_cells))
+                    best_dz = dz
+
+        return best_plan or [], best_dz, best_total
+
+    # ================================================================
+    # CASE 2: Single trip — unified active + preview search
+    # ================================================================
+    combined = active_pruned + (preview_pruned if preview_slots > 0 else [])
+    k = active_k + min(preview_slots, len(preview_pruned))
+    k = min(k, len(combined))
+    if k == 0:
+        return [], drop_zones[0], float('inf')
+
+    best_cost, best_items, best_cells, best_dz = float('inf'), None, None, drop_zones[0]
+
+    for perm in iperms(combined, k):
+        # Must have exactly active_k active items
+        a_count = sum(1 for i in perm if i["id"] in active_ids)
+        if a_count != active_k:
             continue
-        cost, cells = route_cost_and_cells(perm)
-        if cost < best_cost:
-            best_cost, best_items, best_cells = cost, list(perm), cells
+        p_count = len(perm) - a_count
+        if p_count > preview_slots:
+            continue
 
-    if best_items is None:
-        return []
+        # Validate type constraints
+        atc = Counter(i["type"] for i in perm if i["id"] in active_ids)
+        if any(atc[t] > remaining_ctr[t] for t in atc):
+            continue
+        ptc = Counter(i["type"] for i in perm if i["id"] in preview_ids)
+        if any(ptc[t] > preview_ctr[t] for t in ptc):
+            continue
 
-    plan = list(zip([i["id"] for i in best_items], best_cells))
+        for dz in drop_zones:
+            cost, cells = route_cost(perm, pos, dz)
+            if cost < best_cost:
+                best_cost, best_items, best_cells, best_dz = cost, list(perm), cells, dz
 
-    # En-route pre-fetch: insert preview items that cost ≤ 4 extra moves
-    if len(plan) < capacity_left and preview_types:
-        already_planned = {pid for pid, _ in plan}
-        preview_counter = Counter(preview_types)
-        preview_cands = []
-        for item in items_on_map:
-            if (item["type"] in preview_counter
-                    and item["id"] not in assigned_items
-                    and item["id"] not in already_planned):
-                cells = pickup_cells(tuple(item["position"]), eff_wall_set, width, height)
-                if cells:
-                    item_cells[item["id"]] = cells
-                    preview_cands.append(item)
-        preview_cands.sort(key=lambda i: manhattan(pos, tuple(i["position"])))
-
-        for pitem in preview_cands:
-            if len(plan) >= capacity_left:
-                break
-            for c in item_cells[pitem["id"]]:
-                if c not in dist_from:
-                    dist_from[c] = bfs_all_dists(c, eff_wall_set, width, height)
-
-            route_nodes = [pos] + [c for _, c in plan] + [drop_t]
-            best_detour, best_idx, best_cell = float('inf'), None, None
-            for idx in range(len(route_nodes) - 1):
-                fn, tn = route_nodes[idx], route_nodes[idx+1]
-                orig = dist_from[fn].get(tn, float('inf'))
-                for c in item_cells[pitem["id"]]:
-                    detour = (dist_from[fn].get(c, float('inf'))
-                              + dist_from[c].get(tn, float('inf'))
-                              - orig)
-                    if detour < best_detour:
-                        best_detour, best_idx, best_cell = detour, idx, c
-            if best_detour <= 4 and best_idx is not None:
-                plan.insert(best_idx, (pitem["id"], best_cell))
-
-    return plan
+    if best_items:
+        return list(zip([i["id"] for i in best_items], best_cells)), best_dz, best_cost
+    return [], drop_zones[0], float('inf')
 
 
 # ---------------------------------------------------------------------------
-# Decision
+# Decision logic
 # ---------------------------------------------------------------------------
 
-def decide_bot(bot, state, assigned_items):
-    x, y = bot["position"]
-    pos = (x, y)
+def decide_bot(bot, state, assigned_items, wall_set, width, height):
+    pos = tuple(bot["position"])
     inventory = bot["inventory"]
     bot_id = bot["id"]
 
-    grid = state["grid"]
-    width, height = grid["width"], grid["height"]
-    walls = grid["walls"]
+    active_needed, preview_needed = get_order_info(state)
+    remaining = list((Counter(active_needed) - Counter(inventory)).elements())
+    deliverable = [i for i in inventory if i in active_needed]
 
-    # Shelf/item positions are impassable (not in grid["walls"] but server blocks them)
-    eff_walls = walls + [item["position"] for item in state["items"]]
-    eff_wall_set = set(map(tuple, eff_walls))
+    drop_zones = [tuple(z) for z in state.get("drop_off_zones", [state["drop_off"]])]
+    nearest_dz = min(drop_zones, key=lambda z: manhattan(pos, z))
+    on_drop_off = pos in set(drop_zones)
 
-    other_positions = {tuple(b["position"]) for b in state["bots"] if b["id"] != bot_id}
-    drop_off = nearest_drop_off(pos, state)
-    drop_off_t = tuple(drop_off)
-    on_drop_off = (list(pos) == drop_off)
-
-    needed = get_needed_items(state)
-    preview = get_preview_items(state)
-    remaining_needed = list((Counter(needed) - Counter(inventory)).elements())
-
-    # Drop off only if we're carrying items the active order actually needs
-    deliverable = [item for item in inventory if item in needed]
+    # --- 1. On drop-off with deliverables → deliver ---
     if on_drop_off and deliverable:
         return {"bot": bot_id, "action": "drop_off"}, None
 
-    # Head to drop-off if we have all needed items, or inventory is full and has deliverables
-    if deliverable and (not remaining_needed or len(inventory) >= 3):
-        action = bfs(pos, drop_off_t, eff_walls, width, height, other_positions)
+    # --- 2. Inventory full with deliverables → head to drop-off ---
+    if len(inventory) >= 3 and deliverable:
+        action = bfs_first_action(pos, nearest_dz, wall_set, width, height)
         return {"bot": bot_id, "action": action}, None
 
-    # Plan the optimal trip
-    plan = plan_trip(
-        pos, inventory, needed, preview,
+    # --- 3. All active items collected, spare capacity → grab preview items? ---
+    if deliverable and not remaining and len(inventory) < 3:
+        plan, dz, plan_cost = plan_trip(
+            pos, inventory, [], preview_needed,
+            state["items"], assigned_items,
+            wall_set, width, height, drop_zones,
+        )
+        if plan:
+            # Is the detour worth it?
+            direct = dist_to_nearest_dz(pos, drop_zones, wall_set, width, height)
+            detour = plan_cost - direct
+            if detour <= MAX_PREVIEW_DETOUR:
+                return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height)
+
+        # No worthwhile preview items → go deliver
+        action = bfs_first_action(pos, nearest_dz, wall_set, width, height)
+        return {"bot": bot_id, "action": action}, None
+
+    # --- 4. Still need items → plan cross-order trip ---
+    plan, dz, cost = plan_trip(
+        pos, inventory, active_needed, preview_needed,
         state["items"], assigned_items,
-        eff_wall_set, width, height, drop_off,
+        wall_set, width, height, drop_zones,
     )
 
     if not plan:
         if inventory:
-            action = bfs(pos, drop_off_t, eff_walls, width, height, other_positions)
+            action = bfs_first_action(pos, nearest_dz, wall_set, width, height)
             return {"bot": bot_id, "action": action}, None
         return {"bot": bot_id, "action": "wait"}, None
 
+    return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height)
+
+
+def execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height):
+    """Execute the first step of a plan: pick up if adjacent, else move."""
     target_id, goal_cell = plan[0]
     target_item = next((i for i in state["items"] if i["id"] == target_id), None)
     if target_item is None:
         return {"bot": bot_id, "action": "wait"}, None
 
-    if is_adjacent(pos, tuple(target_item["position"])):
+    if manhattan(pos, tuple(target_item["position"])) == 1:
         return {"bot": bot_id, "action": "pick_up", "item_id": target_id}, target_id
 
-    action = bfs(pos, goal_cell, eff_walls, width, height, other_positions)
+    action = bfs_first_action(pos, goal_cell, wall_set, width, height)
     return {"bot": bot_id, "action": action}, target_id
 
 
+def dist_to_nearest_dz(pos, drop_zones, wall_set, width, height):
+    """BFS distance from pos to nearest drop-off zone."""
+    d = bfs_dists(pos, wall_set, width, height)
+    return min(d.get(dz, float('inf')) for dz in drop_zones)
+
+
+# ---------------------------------------------------------------------------
+# Top-level per-round decision
+# ---------------------------------------------------------------------------
+
 def decide_all(state):
+    width = state["grid"]["width"]
+    height = state["grid"]["height"]
+    walls = state["grid"]["walls"]
+
+    # Effective walls: grid walls + item shelf positions
+    item_positions = [item["position"] for item in state["items"]]
+    wall_set = set(map(tuple, walls + item_positions))
+
     actions = []
     assigned_items = set()
     for bot in sorted(state["bots"], key=lambda b: -len(b["inventory"])):
-        action, claimed = decide_bot(bot, state, assigned_items)
+        action, claimed = decide_bot(bot, state, assigned_items, wall_set, width, height)
         actions.append(action)
         if claimed:
             assigned_items.add(claimed)
@@ -341,13 +438,13 @@ async def play(token):
 
             actions = decide_all(state)
 
-            if round_num < 10 or round_num % 20 == 0:
+            if round_num < 5 or round_num % 50 == 0:
+                active_needed, preview_needed = get_order_info(state)
                 for bot in state["bots"]:
                     a = next((a for a in actions if a["bot"] == bot["id"]), "?")
-                    print(f"  Round {round_num} | Bot {bot['id']} @ {bot['position']} | inv={bot['inventory']} | action={a}")
-                needed = get_needed_items(state)
-                items_on_map = [(i["type"], i["position"]) for i in state["items"] if i["type"] in needed]
-                print(f"  Needed: {needed} | On map: {items_on_map} | Drop-off: {state['drop_off']} | Score: {score}")
+                    print(f"  R{round_num:3d} | Bot {bot['id']} @ {bot['position']} "
+                          f"inv={bot['inventory']} | {a.get('action','?')}")
+                print(f"       Active: {active_needed} | Preview: {preview_needed} | Score: {score}")
 
             await ws.send(json.dumps({"actions": actions}))
 
@@ -357,7 +454,7 @@ async def play(token):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NM i AI 2026 Grocery Bot (experimental)")
+    parser = argparse.ArgumentParser(description="NM i AI 2026 Grocery Bot (v2)")
     parser.add_argument("--token", required=True)
     args = parser.parse_args()
     asyncio.run(play(args.token))
