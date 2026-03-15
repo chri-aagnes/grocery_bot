@@ -325,7 +325,7 @@ def plan_trip(pos, inventory, active_needed, preview_needed,
 # Decision logic
 # ---------------------------------------------------------------------------
 
-def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width, height, soft_blocked=None):
+def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width, height, soft_blocked=None, allow_preview=True):
     pos = tuple(bot["position"])
     inventory = bot["inventory"]
     bot_id = bot["id"]
@@ -399,10 +399,10 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
                 # Has items to deliver — head to drop-off
                 action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
                 return {"bot": bot_id, "action": action}, None
-            # Stale inventory (items not needed by active order) — try pre-fetching
-            # preview items to fill spare capacity rather than waiting idle.
+            # Stale inventory (items not needed by active order).
+            # If there's spare capacity, try pre-fetching preview items.
             # Safe: preview items become deliverable when the order advances.
-            if preview_needed and len(inventory) < 3:
+            if preview_needed and len(inventory) < 3 and allow_preview:
                 preview_plan, preview_dz, _ = plan_trip(
                     pos, inventory, [], preview_needed,
                     state["items"], assigned_items,
@@ -416,7 +416,7 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
             # No inventory, no active items to collect → pre-fetch preview if possible.
             # Safe: bot carries nothing stale, and preview items become deliverable
             # when the current active order completes.
-            if preview_needed:
+            if preview_needed and allow_preview:
                 preview_plan, preview_dz, _ = plan_trip(
                     pos, [], [], preview_needed,
                     state["items"], assigned_items,
@@ -499,6 +499,13 @@ def decide_all(state):
     assigned_items = set()
     assigned_type_counts = Counter()  # types claimed for pickup this round
     reserved_next = set()  # cells already claimed by higher-priority bots this round
+    drop_zone_set = set(tuple(z) for z in state.get("drop_off_zones", [state["drop_off"]]))
+
+    # Cap simultaneous preview pre-fetchers to avoid stale inventory pile-up.
+    # On large fleets (5 bots) orders cycle fast; too many bots grabbing preview
+    # items causes stale full inventories. 2 pre-fetchers is a safe limit.
+    preview_prefetch_count = 0
+    max_preview_prefetch = 2 if len(state["bots"]) >= 4 else len(state["bots"])
 
     for bot in sorted(state["bots"], key=lambda b: -len(b["inventory"])):
         pos = tuple(bot["position"])
@@ -509,24 +516,38 @@ def decide_all(state):
         other_deliverable = +(other_deliverable & active_needed_ctr)
         effective_assigned = assigned_type_counts + other_deliverable
 
+        allow_preview = preview_prefetch_count < max_preview_prefetch
         action, claimed = decide_bot(bot, state, assigned_items, effective_assigned,
-                                     wall_set, width, height, soft_blocked)
+                                     wall_set, width, height, soft_blocked,
+                                     allow_preview=allow_preview)
 
-        # Prevent swap deadlock: if this bot would move into another bot's current
-        # cell while that bot has already reserved our current cell, they'd oscillate
-        # forever. Force the lower-priority bot to wait one round instead.
+        # Prevent swap deadlock only when bots move in exactly opposite directions
+        # (e.g. one going up, the other going down). Same-direction passing is fine.
         act_name = action["action"]
         next_c = _next_pos(pos, act_name)
-        if act_name.startswith("move_") and next_c in all_bot_positions and pos in reserved_next:
-            action = {"bot": bot["id"], "action": "wait"}
-            next_c = pos
-            claimed = None
+        opposite = {"move_up":"move_down","move_down":"move_up",
+                    "move_left":"move_right","move_right":"move_left"}
+        # Don't apply anti-swap when stepping aside at a drop-off zone —
+        # yielding to a delivering bot is cooperative, not a deadlock.
+        if (act_name.startswith("move_") and next_c in all_bot_positions
+                and pos in reserved_next and pos not in drop_zone_set):
+            bot_at_next = next((b for b in state["bots"] if tuple(b["position"]) == next_c), None)
+            if bot_at_next:
+                their_act = next((a["action"] for a in actions if a["bot"] == bot_at_next["id"]), None)
+                if their_act == opposite.get(act_name):
+                    action = {"bot": bot["id"], "action": "wait"}
+                    next_c = pos
+                    claimed = None
 
         actions.append(action)
         if claimed:
             assigned_items.add(claimed)
             if claimed in item_type_by_id:
-                assigned_type_counts[item_type_by_id[claimed]] += 1
+                t = item_type_by_id[claimed]
+                assigned_type_counts[t] += 1
+                # Count as preview prefetch if this type isn't needed for active order
+                if t not in active_needed_ctr:
+                    preview_prefetch_count += 1
         reserved_next.add(next_c)
     return actions
 
