@@ -29,27 +29,39 @@ MAX_PREVIEW_DETOUR = 10
 # Pathfinding
 # ---------------------------------------------------------------------------
 
-def bfs_first_action(start, goal, wall_set, width, height):
-    """Return the first move action toward goal, or 'wait'."""
+def bfs_first_action(start, goal, wall_set, width, height, soft_blocked=None):
+    """Return the first move action toward goal, or 'wait'.
+    If soft_blocked is given, tries to avoid those cells first; falls back
+    to ignoring them if no path exists (e.g. unavoidable narrow corridor)."""
     if start == goal:
         return "wait"
-    queue = deque([(start[0], start[1], None)])
-    visited = {start}
-    dirs = [("move_up",0,-1),("move_down",0,1),("move_left",-1,0),("move_right",1,0)]
-    while queue:
-        x, y, first = queue.popleft()
-        for action, dx, dy in dirs:
-            nx, ny = x + dx, y + dy
-            if (nx, ny) in visited or nx < 0 or ny < 0 or nx >= width or ny >= height:
-                continue
-            if (nx, ny) in wall_set:
-                continue
-            fa = first or action
-            if (nx, ny) == goal:
-                return fa
-            visited.add((nx, ny))
-            queue.append((nx, ny, fa))
-    return "wait"
+
+    def _bfs(wset):
+        queue = deque([(start[0], start[1], None)])
+        visited = {start}
+        dirs = [("move_up",0,-1),("move_down",0,1),("move_left",-1,0),("move_right",1,0)]
+        while queue:
+            x, y, first = queue.popleft()
+            for action, dx, dy in dirs:
+                nx, ny = x + dx, y + dy
+                if (nx, ny) in visited or nx < 0 or ny < 0 or nx >= width or ny >= height:
+                    continue
+                if (nx, ny) in wset:
+                    continue
+                fa = first or action
+                if (nx, ny) == goal:
+                    return fa
+                visited.add((nx, ny))
+                queue.append((nx, ny, fa))
+        return "wait"
+
+    if soft_blocked:
+        result = _bfs(wall_set | soft_blocked)
+        if result != "wait":
+            return result
+        # Fallback: allow path through soft_blocked (unavoidable narrow corridor)
+        return _bfs(wall_set)
+    return _bfs(wall_set)
 
 
 def bfs_dists(start, wall_set, width, height):
@@ -133,7 +145,8 @@ def preview_still_needed(inventory, active_needed, preview_needed):
 
 def plan_trip(pos, inventory, active_needed, preview_needed,
               items_on_map, assigned_items,
-              wall_set, width, height, drop_zones):
+              wall_set, width, height, drop_zones,
+              assigned_type_counts=None):
     """
     Plan optimal item collection trip.
 
@@ -150,6 +163,11 @@ def plan_trip(pos, inventory, active_needed, preview_needed,
     # Remaining active items (accounting for inventory)
     remaining = list((Counter(active_needed) - Counter(inventory)).elements())
     remaining_ctr = Counter(remaining)
+
+    # Subtract items already assigned to other bots to avoid over-collection
+    if assigned_type_counts:
+        remaining_ctr = +(remaining_ctr - assigned_type_counts)  # drop zeros
+        remaining = list(remaining_ctr.elements())
 
     # Preview items still needed (accounting for what we'll have after delivery)
     preview_ctr = preview_still_needed(inventory, active_needed, preview_needed)
@@ -307,7 +325,7 @@ def plan_trip(pos, inventory, active_needed, preview_needed,
 # Decision logic
 # ---------------------------------------------------------------------------
 
-def decide_bot(bot, state, assigned_items, wall_set, width, height):
+def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width, height, soft_blocked=None):
     pos = tuple(bot["position"])
     inventory = bot["inventory"]
     bot_id = bot["id"]
@@ -326,11 +344,14 @@ def decide_bot(bot, state, assigned_items, wall_set, width, height):
 
     # --- 2. Inventory full with deliverables → head to drop-off ---
     if len(inventory) >= 3 and deliverable:
-        action = bfs_first_action(pos, nearest_dz, wall_set, width, height)
+        action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
         return {"bot": bot_id, "action": action}, None
 
     # --- 3. All active items collected, spare capacity → grab preview items? ---
-    if deliverable and not remaining and len(inventory) < 3:
+    # Only on single-bot maps: with multiple bots another bot can complete the
+    # active order while we're collecting preview items, leaving us with a full
+    # inventory of non-deliverable items that we can never drop off.
+    if deliverable and not remaining and len(inventory) < 3 and len(state["bots"]) == 1:
         plan, dz, plan_cost = plan_trip(
             pos, inventory, [], preview_needed,
             state["items"], assigned_items,
@@ -341,29 +362,76 @@ def decide_bot(bot, state, assigned_items, wall_set, width, height):
             direct = dist_to_nearest_dz(pos, drop_zones, wall_set, width, height)
             detour = plan_cost - direct
             if detour <= MAX_PREVIEW_DETOUR:
-                return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height)
+                return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height, soft_blocked)
 
         # No worthwhile preview items → go deliver
-        action = bfs_first_action(pos, nearest_dz, wall_set, width, height)
+        action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
         return {"bot": bot_id, "action": action}, None
 
     # --- 4. Still need items → plan cross-order trip ---
+    # Disable preview pre-fetching on multi-bot maps: other bots can complete
+    # the active order before we deliver, leaving us with stale non-deliverable
+    # items that can never be dropped off.
+    preview_for_plan = preview_needed if len(state["bots"]) == 1 else []
     plan, dz, cost = plan_trip(
-        pos, inventory, active_needed, preview_needed,
+        pos, inventory, active_needed, preview_for_plan,
         state["items"], assigned_items,
         wall_set, width, height, drop_zones,
+        assigned_type_counts,
     )
 
     if not plan:
         if inventory:
-            action = bfs_first_action(pos, nearest_dz, wall_set, width, height)
-            return {"bot": bot_id, "action": action}, None
-        return {"bot": bot_id, "action": "wait"}, None
+            if on_drop_off:
+                # Step aside — bot is blocking the drop-off for others
+                avoid = wall_set | (soft_blocked or set())
+                move_dir = {(0,1):"move_down",(1,0):"move_right",(0,-1):"move_up",(-1,0):"move_left"}
+                for delta, act in move_dir.items():
+                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+                    if (nx,ny) not in avoid and 0 <= nx < width and 0 <= ny < height:
+                        return {"bot": bot_id, "action": act}, None
+                # All preferred cells blocked — try ignoring soft_blocked
+                for delta, act in move_dir.items():
+                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+                    if (nx,ny) not in wall_set and 0 <= nx < width and 0 <= ny < height:
+                        return {"bot": bot_id, "action": act}, None
+            if deliverable:
+                # Has items to deliver — head to drop-off
+                action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
+                return {"bot": bot_id, "action": action}, None
+            # No deliverables and not at drop-off — wait in place, don't crowd drop-off
+            return {"bot": bot_id, "action": "wait"}, None
+        else:
+            # No inventory, no active items to collect → pre-fetch preview if possible.
+            # Safe: bot carries nothing stale, and preview items become deliverable
+            # when the current active order completes.
+            if preview_needed:
+                preview_plan, preview_dz, _ = plan_trip(
+                    pos, [], [], preview_needed,
+                    state["items"], assigned_items,
+                    wall_set, width, height, drop_zones,
+                )
+                if preview_plan:
+                    return execute_first_step(bot_id, preview_plan, state, pos, preview_dz,
+                                              wall_set, width, height, soft_blocked)
+            # Nothing to do — if at drop-off, step aside for other bots
+            if on_drop_off:
+                avoid = wall_set | (soft_blocked or set())
+                move_dir = {(0,1):"move_down",(1,0):"move_right",(0,-1):"move_up",(-1,0):"move_left"}
+                for delta, act in move_dir.items():
+                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+                    if (nx,ny) not in avoid and 0 <= nx < width and 0 <= ny < height:
+                        return {"bot": bot_id, "action": act}, None
+                for delta, act in move_dir.items():
+                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+                    if (nx,ny) not in wall_set and 0 <= nx < width and 0 <= ny < height:
+                        return {"bot": bot_id, "action": act}, None
+            return {"bot": bot_id, "action": "wait"}, None
 
-    return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height)
+    return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height, soft_blocked)
 
 
-def execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height):
+def execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height, soft_blocked=None):
     """Execute the first step of a plan: pick up if adjacent, else move."""
     target_id, goal_cell = plan[0]
     target_item = next((i for i in state["items"] if i["id"] == target_id), None)
@@ -373,7 +441,7 @@ def execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height):
     if manhattan(pos, tuple(target_item["position"])) == 1:
         return {"bot": bot_id, "action": "pick_up", "item_id": target_id}, target_id
 
-    action = bfs_first_action(pos, goal_cell, wall_set, width, height)
+    action = bfs_first_action(pos, goal_cell, wall_set, width, height, soft_blocked)
     return {"bot": bot_id, "action": action}, target_id
 
 
@@ -387,6 +455,14 @@ def dist_to_nearest_dz(pos, drop_zones, wall_set, width, height):
 # Top-level per-round decision
 # ---------------------------------------------------------------------------
 
+def _next_pos(pos, action):
+    """Cell a bot will occupy after taking an action."""
+    d = {"move_up": (0,-1), "move_down": (0,1), "move_left": (-1,0), "move_right": (1,0)}
+    if action in d:
+        return (pos[0] + d[action][0], pos[1] + d[action][1])
+    return pos
+
+
 def decide_all(state):
     width = state["grid"]["width"]
     height = state["grid"]["height"]
@@ -396,13 +472,40 @@ def decide_all(state):
     item_positions = [item["position"] for item in state["items"]]
     wall_set = set(map(tuple, walls + item_positions))
 
+    all_bot_positions = {tuple(b["position"]) for b in state["bots"]}
+    item_type_by_id = {item["id"]: item["type"] for item in state["items"]}
+
+    # Pre-compute deliverable inventory per bot (items matching active order)
+    active_needed, _ = get_order_info(state)
+    active_needed_ctr = Counter(active_needed)
+    bot_deliverable = {
+        bot["id"]: Counter(item for item in bot["inventory"] if item in active_needed_ctr)
+        for bot in state["bots"]
+    }
+    all_deliverable = sum(bot_deliverable.values(), Counter())
+
     actions = []
     assigned_items = set()
+    assigned_type_counts = Counter()  # types claimed for pickup this round
+    reserved_next = set()  # cells already claimed by higher-priority bots this round
+
     for bot in sorted(state["bots"], key=lambda b: -len(b["inventory"])):
-        action, claimed = decide_bot(bot, state, assigned_items, wall_set, width, height)
+        pos = tuple(bot["position"])
+        soft_blocked = (all_bot_positions - {pos}) | reserved_next
+
+        # Other bots' deliverable inventory counts (capped by active order needs)
+        other_deliverable = all_deliverable - bot_deliverable[bot["id"]]
+        other_deliverable = +(other_deliverable & active_needed_ctr)
+        effective_assigned = assigned_type_counts + other_deliverable
+
+        action, claimed = decide_bot(bot, state, assigned_items, effective_assigned,
+                                     wall_set, width, height, soft_blocked)
         actions.append(action)
         if claimed:
             assigned_items.add(claimed)
+            if claimed in item_type_by_id:
+                assigned_type_counts[item_type_by_id[claimed]] += 1
+        reserved_next.add(_next_pos(pos, action["action"]))
     return actions
 
 
