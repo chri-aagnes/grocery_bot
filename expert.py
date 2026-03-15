@@ -325,12 +325,16 @@ def plan_trip(pos, inventory, active_needed, preview_needed,
 # Decision logic
 # ---------------------------------------------------------------------------
 
-def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width, height, soft_blocked=None, allow_preview=True):
+def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width, height, soft_blocked=None, allow_preview=True, preview_override=None):
     pos = tuple(bot["position"])
     inventory = bot["inventory"]
     bot_id = bot["id"]
 
     active_needed, preview_needed = get_order_info(state)
+    # Use caller-supplied remaining preview demand if provided (avoids over-fetching
+    # by accounting for what other bots already carry and what's been assigned).
+    if preview_override is not None:
+        preview_needed = preview_override
     remaining = list((Counter(active_needed) - Counter(inventory)).elements())
     deliverable = [i for i in inventory if i in active_needed]
 
@@ -425,18 +429,30 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
                 if preview_plan:
                     return execute_first_step(bot_id, preview_plan, state, pos, preview_dz,
                                               wall_set, width, height, soft_blocked)
-            # Nothing to do — if at drop-off, step aside for other bots
-            if on_drop_off:
-                avoid = wall_set | (soft_blocked or set())
-                move_dir = {(0,1):"move_down",(1,0):"move_right",(0,-1):"move_up",(-1,0):"move_left"}
-                for delta, act in move_dir.items():
-                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+            # Nothing to do — move away from drop-off to clear delivery paths.
+            # Idle bots parked near the drop-off block delivering bots for many rounds.
+            nearest_dz = min(drop_zones, key=lambda z: manhattan(pos, z))
+            dz_dist = manhattan(pos, nearest_dz)
+            avoid = wall_set | (soft_blocked or set())
+            move_dirs = [(0,1,"move_down"),(1,0,"move_right"),(0,-1,"move_up"),(-1,0,"move_left")]
+            if dz_dist <= 8:
+                # Move to cell that maximises distance from nearest drop-off zone
+                best_act, best_dist = None, dz_dist
+                for dx, dy, act in move_dirs:
+                    nx, ny = pos[0]+dx, pos[1]+dy
                     if (nx,ny) not in avoid and 0 <= nx < width and 0 <= ny < height:
-                        return {"bot": bot_id, "action": act}, None
-                for delta, act in move_dir.items():
-                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+                        d = manhattan((nx, ny), nearest_dz)
+                        if d > best_dist:
+                            best_act, best_dist = act, d
+                if best_act:
+                    return {"bot": bot_id, "action": best_act}, None
+                # Soft-blocked version failed — try ignoring soft_blocked
+                for dx, dy, act in move_dirs:
+                    nx, ny = pos[0]+dx, pos[1]+dy
                     if (nx,ny) not in wall_set and 0 <= nx < width and 0 <= ny < height:
-                        return {"bot": bot_id, "action": act}, None
+                        d = manhattan((nx, ny), nearest_dz)
+                        if d > dz_dist:
+                            return {"bot": bot_id, "action": act}, None
             return {"bot": bot_id, "action": "wait"}, None
 
     return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height, soft_blocked)
@@ -487,25 +503,30 @@ def decide_all(state):
     item_type_by_id = {item["id"]: item["type"] for item in state["items"]}
 
     # Pre-compute deliverable inventory per bot (items matching active order)
-    active_needed, _ = get_order_info(state)
+    active_needed, preview_needed_list = get_order_info(state)
     active_needed_ctr = Counter(active_needed)
+    preview_needed_ctr = Counter(preview_needed_list)
     bot_deliverable = {
         bot["id"]: Counter(item for item in bot["inventory"] if item in active_needed_ctr)
         for bot in state["bots"]
     }
     all_deliverable = sum(bot_deliverable.values(), Counter())
 
+    # Track preview items already held across ALL bots to avoid over-fetching.
+    # Without this, every idle bot independently decides to grab flour/cheese/apples
+    # even when multiple bots already carry those types.
+    all_held_preview = Counter(
+        item for bot in state["bots"]
+        for item in bot["inventory"]
+        if item in preview_needed_ctr
+    )
+
     actions = []
     assigned_items = set()
     assigned_type_counts = Counter()  # types claimed for pickup this round
+    assigned_preview_counts = Counter()  # preview types claimed this round
     reserved_next = set()  # cells already claimed by higher-priority bots this round
     drop_zone_set = set(tuple(z) for z in state.get("drop_off_zones", [state["drop_off"]]))
-
-    # Cap simultaneous preview pre-fetchers to avoid stale inventory pile-up.
-    # On large fleets (5 bots) orders cycle fast; too many bots grabbing preview
-    # items causes stale full inventories. 2 pre-fetchers is a safe limit.
-    preview_prefetch_count = 0
-    max_preview_prefetch = 2 if len(state["bots"]) >= 4 else len(state["bots"])
 
     for bot in sorted(state["bots"], key=lambda b: -len(b["inventory"])):
         pos = tuple(bot["position"])
@@ -516,10 +537,17 @@ def decide_all(state):
         other_deliverable = +(other_deliverable & active_needed_ctr)
         effective_assigned = assigned_type_counts + other_deliverable
 
-        allow_preview = preview_prefetch_count < max_preview_prefetch
+        # Compute remaining preview demand for this bot:
+        # subtract what other bots already carry + what's been assigned this round.
+        this_bot_preview = Counter(item for item in bot["inventory"] if item in preview_needed_ctr)
+        other_held_preview = all_held_preview - this_bot_preview
+        covered_preview = other_held_preview + assigned_preview_counts
+        remaining_preview = list((+(preview_needed_ctr - covered_preview)).elements())
+
         action, claimed = decide_bot(bot, state, assigned_items, effective_assigned,
                                      wall_set, width, height, soft_blocked,
-                                     allow_preview=allow_preview)
+                                     allow_preview=bool(remaining_preview),
+                                     preview_override=remaining_preview)
 
         # Prevent swap deadlock only when bots move in exactly opposite directions
         # (e.g. one going up, the other going down). Same-direction passing is fine.
@@ -545,9 +573,8 @@ def decide_all(state):
             if claimed in item_type_by_id:
                 t = item_type_by_id[claimed]
                 assigned_type_counts[t] += 1
-                # Count as preview prefetch if this type isn't needed for active order
                 if t not in active_needed_ctr:
-                    preview_prefetch_count += 1
+                    assigned_preview_counts[t] += 1
         reserved_next.add(next_c)
     return actions
 
