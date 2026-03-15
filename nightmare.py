@@ -342,12 +342,29 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
     nearest_dz = min(drop_zones, key=lambda z: manhattan(pos, z))
     on_drop_off = pos in set(drop_zones)
 
-    # --- 1. On drop-off with deliverables → deliver ---
-    if on_drop_off and deliverable:
-        return {"bot": bot_id, "action": "drop_off"}, None
+    # --- 1. On drop-off: deliver if possible, else step aside immediately ---
+    if on_drop_off:
+        if deliverable:
+            return {"bot": bot_id, "action": "drop_off"}, None
+        # Stale bot blocking the DZ — step aside so deliverers can use it.
+        avoid = wall_set | (soft_blocked or set())
+        for delta, act in {(0,1):"move_down",(1,0):"move_right",(0,-1):"move_up",(-1,0):"move_left"}.items():
+            nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+            if (nx,ny) not in avoid and 0 <= nx < width and 0 <= ny < height:
+                return {"bot": bot_id, "action": act}, None
+        for delta, act in {(0,1):"move_down",(1,0):"move_right",(0,-1):"move_up",(-1,0):"move_left"}.items():
+            nx, ny = pos[0]+delta[0], pos[1]+delta[1]
+            if (nx,ny) not in wall_set and 0 <= nx < width and 0 <= ny < height:
+                return {"bot": bot_id, "action": act}, None
 
     # --- 2. Inventory full with deliverables → head to drop-off ---
-    if len(inventory) >= 3 and deliverable:
+    # On nightmare (many bots): deliver after 1 item to prevent stale accumulation.
+    # With 20 bots competing for a 7-item order, multi-item trips cause late bots
+    # to collect items for a partly-delivered order → stale for hundreds of rounds.
+    # 1-item trips keep all bots productive and stale-free.
+    n_bots = len(state["bots"])
+    deliver_threshold = 1 if n_bots > 5 else 3
+    if len(inventory) >= deliver_threshold and deliverable:
         action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
         return {"bot": bot_id, "action": action}, None
 
@@ -386,27 +403,15 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
 
     if not plan:
         if inventory:
-            if on_drop_off:
-                # Step aside — bot is blocking the drop-off for others
-                avoid = wall_set | (soft_blocked or set())
-                move_dir = {(0,1):"move_down",(1,0):"move_right",(0,-1):"move_up",(-1,0):"move_left"}
-                for delta, act in move_dir.items():
-                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
-                    if (nx,ny) not in avoid and 0 <= nx < width and 0 <= ny < height:
-                        return {"bot": bot_id, "action": act}, None
-                # All preferred cells blocked — try ignoring soft_blocked
-                for delta, act in move_dir.items():
-                    nx, ny = pos[0]+delta[0], pos[1]+delta[1]
-                    if (nx,ny) not in wall_set and 0 <= nx < width and 0 <= ny < height:
-                        return {"bot": bot_id, "action": act}, None
             if deliverable:
                 # Has items to deliver — head to drop-off
                 action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
                 return {"bot": bot_id, "action": action}, None
-            # Stale inventory (items not needed by active order).
-            # If there's spare capacity, try pre-fetching preview items.
-            # Safe: preview items become deliverable when the order advances.
-            if preview_needed and len(inventory) < 3 and allow_preview:
+            # Stale inventory: on single-bot maps pre-fetch to stay useful;
+            # on multi-bot maps just wait — pre-fetching causes stale accumulation
+            # that permanently blocks corridors on nightmare.
+            n_bots = len(state["bots"])
+            if n_bots == 1 and preview_needed and len(inventory) < 3 and allow_preview:
                 preview_plan, preview_dz, _ = plan_trip(
                     pos, inventory, [], preview_needed,
                     state["items"], assigned_items,
@@ -417,10 +422,11 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
                                               wall_set, width, height, soft_blocked)
             return {"bot": bot_id, "action": "wait"}, None
         else:
-            # No inventory, no active items to collect → pre-fetch preview if possible.
-            # Safe: bot carries nothing stale, and preview items become deliverable
-            # when the current active order completes.
-            if preview_needed and allow_preview:
+            # No inventory, no active items to collect.
+            # On single-bot maps: pre-fetch preview. On multi-bot maps: wait to
+            # avoid collecting items that go stale and permanently clog corridors.
+            n_bots = len(state["bots"])
+            if n_bots == 1 and preview_needed and allow_preview:
                 preview_plan, preview_dz, _ = plan_trip(
                     pos, [], [], preview_needed,
                     state["items"], assigned_items,
@@ -429,30 +435,19 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
                 if preview_plan:
                     return execute_first_step(bot_id, preview_plan, state, pos, preview_dz,
                                               wall_set, width, height, soft_blocked)
-            # Nothing to do — move away from drop-off to clear delivery paths.
-            # Idle bots parked near the drop-off block delivering bots for many rounds.
-            nearest_dz = min(drop_zones, key=lambda z: manhattan(pos, z))
-            dz_dist = manhattan(pos, nearest_dz)
-            avoid = wall_set | (soft_blocked or set())
+            # Step aside if literally blocking a drop-off tile.
             move_dirs = [(0,1,"move_down"),(1,0,"move_right"),(0,-1,"move_up"),(-1,0,"move_left")]
-            if dz_dist <= 8:
-                # Move to cell that maximises distance from nearest drop-off zone
-                best_act, best_dist = None, dz_dist
+            if on_drop_off:
+                avoid = wall_set | (soft_blocked or set())
                 for dx, dy, act in move_dirs:
                     nx, ny = pos[0]+dx, pos[1]+dy
                     if (nx,ny) not in avoid and 0 <= nx < width and 0 <= ny < height:
-                        d = manhattan((nx, ny), nearest_dz)
-                        if d > best_dist:
-                            best_act, best_dist = act, d
-                if best_act:
-                    return {"bot": bot_id, "action": best_act}, None
-                # Soft-blocked version failed — try ignoring soft_blocked
+                        return {"bot": bot_id, "action": act}, None
                 for dx, dy, act in move_dirs:
                     nx, ny = pos[0]+dx, pos[1]+dy
                     if (nx,ny) not in wall_set and 0 <= nx < width and 0 <= ny < height:
-                        d = manhattan((nx, ny), nearest_dz)
-                        if d > dz_dist:
-                            return {"bot": bot_id, "action": act}, None
+                        return {"bot": bot_id, "action": act}, None
+
             return {"bot": bot_id, "action": "wait"}, None
 
     return execute_first_step(bot_id, plan, state, pos, dz, wall_set, width, height, soft_blocked)
@@ -502,15 +497,9 @@ def decide_all(state):
     all_bot_positions = {tuple(b["position"]) for b in state["bots"]}
     item_type_by_id = {item["id"]: item["type"] for item in state["items"]}
 
-    # Pre-compute deliverable inventory per bot (items matching active order)
     active_needed, preview_needed_list = get_order_info(state)
     active_needed_ctr = Counter(active_needed)
     preview_needed_ctr = Counter(preview_needed_list)
-    bot_deliverable = {
-        bot["id"]: Counter(item for item in bot["inventory"] if item in active_needed_ctr)
-        for bot in state["bots"]
-    }
-    all_deliverable = sum(bot_deliverable.values(), Counter())
 
     # Track preview items already held across ALL bots to avoid over-fetching.
     # Without this, every idle bot independently decides to grab flour/cheese/apples
@@ -532,10 +521,11 @@ def decide_all(state):
         pos = tuple(bot["position"])
         soft_blocked = (all_bot_positions - {pos}) | reserved_next
 
-        # Other bots' deliverable inventory counts (capped by active order needs)
-        other_deliverable = all_deliverable - bot_deliverable[bot["id"]]
-        other_deliverable = +(other_deliverable & active_needed_ctr)
-        effective_assigned = assigned_type_counts + other_deliverable
+        # Only count items claimed THIS ROUND by higher-priority bots.
+        # Do NOT subtract other bots' held deliverables: a stuck bot can hold
+        # deliverable items for hundreds of rounds, causing all other bots to
+        # idle and the game to effectively freeze.
+        effective_assigned = assigned_type_counts
 
         # Compute remaining preview demand for this bot:
         # subtract what other bots already carry + what's been assigned this round.
@@ -548,6 +538,22 @@ def decide_all(state):
                                      wall_set, width, height, soft_blocked,
                                      allow_preview=bool(remaining_preview),
                                      preview_override=remaining_preview)
+
+        # Yield-if-blocking: if this bot is waiting but its cell has been reserved
+        # by a higher-priority bot (one already processed this round), step aside.
+        # This prevents idle/stale bots from permanently parking in corridors.
+        if action["action"] == "wait" and pos in reserved_next and pos not in drop_zone_set:
+            dir_deltas = {"move_up":(0,-1),"move_down":(0,1),"move_left":(-1,0),"move_right":(1,0)}
+            for mv, (ddx, ddy) in dir_deltas.items():
+                nnx, nny = pos[0]+ddx, pos[1]+ddy
+                if ((nnx,nny) not in wall_set
+                        and (nnx,nny) not in soft_blocked
+                        and (nnx,nny) not in reserved_next
+                        and 0 <= nnx < width and 0 <= nny < height):
+                    action = {"bot": bot["id"], "action": mv}
+                    next_c = (nnx, nny)
+                    claimed = None
+                    break
 
         # Prevent swap deadlock only when bots move in exactly opposite directions
         # (e.g. one going up, the other going down). Same-direction passing is fine.
@@ -563,9 +569,26 @@ def decide_all(state):
             if bot_at_next:
                 their_act = next((a["action"] for a in actions if a["bot"] == bot_at_next["id"]), None)
                 if their_act == opposite.get(act_name):
-                    action = {"bot": bot["id"], "action": "wait"}
-                    next_c = pos
-                    claimed = None
+                    # Try to sidestep: move perpendicular to clear the way
+                    dir_deltas = {"move_up":(0,-1),"move_down":(0,1),"move_left":(-1,0),"move_right":(1,0)}
+                    perp_moves = [m for m in dir_deltas if m != act_name and m != opposite.get(act_name,'')]
+                    sidestepped = False
+                    for mv in perp_moves:
+                        ddx, ddy = dir_deltas[mv]
+                        nnx, nny = pos[0]+ddx, pos[1]+ddy
+                        if ((nnx,nny) not in wall_set
+                                and (nnx,nny) not in soft_blocked
+                                and (nnx,nny) not in reserved_next
+                                and 0 <= nnx < width and 0 <= nny < height):
+                            action = {"bot": bot["id"], "action": mv}
+                            next_c = (nnx, nny)
+                            claimed = None
+                            sidestepped = True
+                            break
+                    if not sidestepped:
+                        action = {"bot": bot["id"], "action": "wait"}
+                        next_c = pos
+                        claimed = None
 
         actions.append(action)
         if claimed:
@@ -617,7 +640,8 @@ async def play(token):
                     a = next((a for a in actions if a["bot"] == bot["id"]), "?")
                     print(f"  R{round_num:3d} | Bot {bot['id']} @ {bot['position']} "
                           f"inv={bot['inventory']} | {a.get('action','?')}")
-                print(f"       Active: {active_needed} | Preview: {preview_needed} | Score: {score}")
+                drop_zones = state.get("drop_off_zones", [state["drop_off"]])
+                print(f"       Active: {active_needed} | Preview: {preview_needed} | Score: {score} | DZ: {drop_zones} | Map: {state['grid']['width']}x{state['grid']['height']}")
 
             await ws.send(json.dumps({"actions": actions}))
 
