@@ -399,7 +399,18 @@ def decide_bot(bot, state, assigned_items, assigned_type_counts, wall_set, width
                 # Has items to deliver — head to drop-off
                 action = bfs_first_action(pos, nearest_dz, wall_set, width, height, soft_blocked)
                 return {"bot": bot_id, "action": action}, None
-            # No deliverables and not at drop-off — wait in place, don't crowd drop-off
+            # Stale inventory (items not needed by active order) — try pre-fetching
+            # preview items to fill spare capacity rather than waiting idle.
+            # Safe: preview items become deliverable when the order advances.
+            if preview_needed and len(inventory) < 3:
+                preview_plan, preview_dz, _ = plan_trip(
+                    pos, inventory, [], preview_needed,
+                    state["items"], assigned_items,
+                    wall_set, width, height, drop_zones,
+                )
+                if preview_plan:
+                    return execute_first_step(bot_id, preview_plan, state, pos, preview_dz,
+                                              wall_set, width, height, soft_blocked)
             return {"bot": bot_id, "action": "wait"}, None
         else:
             # No inventory, no active items to collect → pre-fetch preview if possible.
@@ -500,12 +511,23 @@ def decide_all(state):
 
         action, claimed = decide_bot(bot, state, assigned_items, effective_assigned,
                                      wall_set, width, height, soft_blocked)
+
+        # Prevent swap deadlock: if this bot would move into another bot's current
+        # cell while that bot has already reserved our current cell, they'd oscillate
+        # forever. Force the lower-priority bot to wait one round instead.
+        act_name = action["action"]
+        next_c = _next_pos(pos, act_name)
+        if act_name.startswith("move_") and next_c in all_bot_positions and pos in reserved_next:
+            action = {"bot": bot["id"], "action": "wait"}
+            next_c = pos
+            claimed = None
+
         actions.append(action)
         if claimed:
             assigned_items.add(claimed)
             if claimed in item_type_by_id:
                 assigned_type_counts[item_type_by_id[claimed]] += 1
-        reserved_next.add(_next_pos(pos, action["action"]))
+        reserved_next.add(next_c)
     return actions
 
 
